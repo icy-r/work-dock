@@ -389,6 +389,9 @@ internal sealed partial class WorkListPage : ListPage
     private static readonly string[] ReviewOrder = ["To review", "Approved by you", "Bots (Renovate etc.)"];
 
     private readonly WorkKind _kind;
+    private readonly ListItem _refresh = new(new RefreshWorkCommand()) { Title = "Refresh", Icon = WorkIcons.Refresh, Section = "—" };
+    private readonly object _gate = new();
+    private string _signature = "<init>";
 
     public WorkListPage(WorkKind kind)
     {
@@ -401,23 +404,52 @@ internal sealed partial class WorkListPage : ListPage
             WorkKind.MyPrs => ("My PRs", "Bitbucket: my open pull requests", WorkIcons.MyPr, "Filter pull requests…"),
             _ => ("Review", "Bitbucket: pull requests to review", WorkIcons.Review, "Filter pull requests…"),
         };
-        WorkMonitor.Changed += _ => RaiseItemsChanged();
+        WorkMonitor.Changed += OnChanged;
     }
 
     public override IListItem[] GetItems()
     {
         var s = WorkMonitor.Current;
-        var refresh = new ListItem(new RefreshWorkCommand())
+        lock (_gate)
         {
-            Title = "Refresh",
-            Subtitle = $"updated {s.UpdatedAt:HH:mm}" + (_kind == WorkKind.Review ? $" · scans {s.ReviewReposScanned} repos (your working set)" : string.Empty),
-            Icon = WorkIcons.Refresh,
-            Section = "—",
-        };
+            _refresh.Subtitle = RefreshText(s);
+            var items = Build(s);
+            _signature = Signature(items);
+            return [.. items, _refresh];
+        }
+    }
+
+    // Reloading the list (RaiseItemsChanged) moves the selection back to the first row. So on a poll,
+    // update the Refresh row in place, and reload only when the rows themselves changed.
+    private void OnChanged(WorkSnapshot s)
+    {
+        lock (_gate)
+        {
+            _refresh.Subtitle = RefreshText(s);
+            var signature = Signature(Build(s));
+            if (signature == _signature)
+            {
+                return;
+            }
+
+            _signature = signature;
+        }
+
+        RaiseItemsChanged();
+    }
+
+    private string RefreshText(WorkSnapshot s) =>
+        $"updated {s.UpdatedAt:HH:mm}" + (_kind == WorkKind.Review ? $" · scans {s.ReviewReposScanned} repos (your working set)" : string.Empty);
+
+    private static string Signature(List<ListItem> items) =>
+        string.Join("\n", items.Select(i => $"{i.Section}|{i.Title}|{i.Subtitle}|{string.Join(",", (i.Tags ?? []).Select(t => t.Text))}"));
+
+    private List<ListItem> Build(WorkSnapshot s)
+    {
         var error = _kind == WorkKind.Jira ? s.JiraError : s.BitbucketError;
         if (error is not null)
         {
-            return [new ListItem(new NoOpCommand()) { Title = error, Icon = WorkIcons.Error }, refresh];
+            return [new ListItem(new NoOpCommand()) { Title = error, Icon = WorkIcons.Error }];
         }
 
         var items = _kind switch
@@ -432,8 +464,7 @@ internal sealed partial class WorkListPage : ListPage
             items.Add(new ListItem(new NoOpCommand()) { Title = "Nothing here", Icon = WorkIcons.ReviewDone });
         }
 
-        items.Add(refresh);
-        return items.Cast<IListItem>().ToArray();
+        return items;
     }
 }
 
